@@ -5,6 +5,7 @@ data "archive_file" "lambda" {
   source_dir  = "${path.module}/../build"
   output_path = "${path.module}/lambda.zip"
 }
+#lmb
 
 resource "aws_iam_role" "lambda" {
   name = "oficina-auth-${var.environment}"
