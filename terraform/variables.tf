@@ -15,7 +15,13 @@ variable "database_url" {
 
 variable "jwt_secret" {
   type      = string
+  default   = ""
   sensitive = true
+}
+
+variable "vpc_id" {
+  type    = string
+  default = ""
 }
 
 variable "lambda_subnet_ids" {
@@ -26,4 +32,9 @@ variable "lambda_subnet_ids" {
 variable "lambda_security_group_ids" {
   type    = list(string)
   default = []
+}
+
+variable "backend_base_url" {
+  type    = string
+  default = ""
 }
