@@ -29,7 +29,7 @@ jobs:
 
       - name: Run tests
         env:
-          PYTHONPATH: src
+          PYTHONPATH: .
           JWT_SECRET: test-secret
         run: pytest -q
 
