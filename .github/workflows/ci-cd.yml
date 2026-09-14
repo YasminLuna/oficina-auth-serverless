@@ -78,6 +78,9 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
       - name: Discover infrastructure and database secret
         shell: bash
         run: |
@@ -88,13 +91,33 @@ jobs:
             echo "VPC oficina-${ENV_NAME} não encontrada" >&2
             exit 1
           fi
-          SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=${VPC_ID}" "Name=tag:Name,Values=oficina-${ENV_NAME}-private-*" --query 'Subnets[].SubnetId' --output json)
-          DATABASE_SECRET=$(aws secretsmanager get-secret-value --secret-id "oficina/${ENV_NAME}/database" --query SecretString --output text)
+
+          SUBNET_IDS=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=${VPC_ID}" "Name=tag:Name,Values=oficina-${ENV_NAME}-private-*" \
+            --query 'Subnets[].SubnetId' --output json)
+
+          DATABASE_SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id "oficina/${ENV_NAME}/database" \
+            --query SecretString --output text)
           DATABASE_URL=$(echo "$DATABASE_SECRET" | jq -r '.url')
+
+          BACKEND_BASE_URL=""
+          CLUSTER_NAME="oficina-${ENV_NAME}"
+          if aws eks describe-cluster --name "$CLUSTER_NAME" >/dev/null 2>&1; then
+            aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "${{ vars.AWS_REGION || 'us-east-1' }}" >/dev/null
+            HOST=$(kubectl -n oficina get service oficina-api -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            if [ -z "$HOST" ]; then
+              HOST=$(kubectl -n oficina get service oficina-api -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            fi
+            if [ -n "$HOST" ]; then
+              BACKEND_BASE_URL="http://${HOST}"
+            fi
+          fi
+
           echo "TF_VAR_vpc_id=$VPC_ID" >> "$GITHUB_ENV"
           echo "TF_VAR_lambda_subnet_ids=$SUBNET_IDS" >> "$GITHUB_ENV"
           echo "TF_VAR_database_url=$DATABASE_URL" >> "$GITHUB_ENV"
-          echo "TF_VAR_backend_base_url=${{ vars.BACKEND_BASE_URL }}" >> "$GITHUB_ENV"
+          echo "TF_VAR_backend_base_url=$BACKEND_BASE_URL" >> "$GITHUB_ENV"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -124,3 +147,6 @@ jobs:
           echo "AUTH_URL=$(terraform output -raw auth_url)" >> "$GITHUB_STEP_SUMMARY"
           echo "API_GATEWAY_URL=$(terraform output -raw api_gateway_url)" >> "$GITHUB_STEP_SUMMARY"
           echo "LAMBDA_NAME=$(terraform output -raw lambda_name)" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${TF_VAR_backend_base_url:-}" ]; then
+            echo "BACKEND_PROXY=${TF_VAR_backend_base_url}" >> "$GITHUB_STEP_SUMMARY"
+          fi
