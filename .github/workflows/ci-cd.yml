@@ -86,9 +86,14 @@ jobs:
         run: |
           set -euo pipefail
           ENV_NAME="${{ github.ref_name == 'main' && 'prod' || 'hml' }}"
-          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=oficina-${ENV_NAME}" --query 'Vpcs[0].VpcId' --output text)
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters \
+              "Name=tag:Project,Values=FIAP-Tech-Challenge-Fase3" \
+              "Name=tag:Environment,Values=${ENV_NAME}" \
+              "Name=tag:ManagedBy,Values=Terraform" \
+            --query 'Vpcs[0].VpcId' --output text)
           if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
-            echo "VPC oficina-${ENV_NAME} não encontrada" >&2
+            echo "VPC da Fase 3 para ${ENV_NAME} não encontrada" >&2
             exit 1
           fi
 
