@@ -2,9 +2,14 @@ import os
 import psycopg
 
 
-def find_customer_by_cpf(cpf: str):
+def _database_dsn() -> str:
     dsn = os.environ['DATABASE_URL']
-    with psycopg.connect(dsn, connect_timeout=5) as conn:
+    # SQLAlchemy uses postgresql+psycopg://, while psycopg expects postgresql://.
+    return dsn.replace('postgresql+psycopg://', 'postgresql://', 1)
+
+
+def find_customer_by_cpf(cpf: str):
+    with psycopg.connect(_database_dsn(), connect_timeout=5) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 'SELECT id, document, active FROM customers WHERE document = %s LIMIT 1',
