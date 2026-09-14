@@ -1,6 +1,7 @@
 name: CI/CD - Auth Serverless
 
 on:
+  workflow_dispatch:
   pull_request:
     branches: [main, hml]
   push:
@@ -54,7 +55,7 @@ jobs:
         run: terraform validate -no-color
 
   deploy:
-    if: github.event_name == 'push' && vars.ENABLE_DEPLOY == 'true'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && vars.ENABLE_DEPLOY == 'true' && vars.TF_STATE_READY == 'true' && vars.TF_STATE_BUCKET != ''
     needs: validate
     runs-on: ubuntu-latest
     environment: ${{ github.ref_name == 'main' && 'production' || 'homologation' }}
@@ -77,6 +78,24 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
+      - name: Discover infrastructure and database secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENV_NAME="${{ github.ref_name == 'main' && 'prod' || 'hml' }}"
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=oficina-${ENV_NAME}" --query 'Vpcs[0].VpcId' --output text)
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "VPC oficina-${ENV_NAME} não encontrada" >&2
+            exit 1
+          fi
+          SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=${VPC_ID}" "Name=tag:Name,Values=oficina-${ENV_NAME}-private-*" --query 'Subnets[].SubnetId' --output json)
+          DATABASE_SECRET=$(aws secretsmanager get-secret-value --secret-id "oficina/${ENV_NAME}/database" --query SecretString --output text)
+          DATABASE_URL=$(echo "$DATABASE_SECRET" | jq -r '.url')
+          echo "TF_VAR_vpc_id=$VPC_ID" >> "$GITHUB_ENV"
+          echo "TF_VAR_lambda_subnet_ids=$SUBNET_IDS" >> "$GITHUB_ENV"
+          echo "TF_VAR_database_url=$DATABASE_URL" >> "$GITHUB_ENV"
+          echo "TF_VAR_backend_base_url=${{ vars.BACKEND_BASE_URL }}" >> "$GITHUB_ENV"
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -84,13 +103,24 @@ jobs:
 
       - name: Terraform init
         working-directory: terraform
-        run: terraform init -input=false
+        run: >-
+          terraform init -input=false
+          -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          -backend-config="key=oficina-auth-serverless/${{ github.ref_name }}/terraform.tfstate"
+          -backend-config="region=${{ vars.AWS_REGION || 'us-east-1' }}"
+          -backend-config="encrypt=true"
 
       - name: Terraform apply
         working-directory: terraform
         env:
           TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
           TF_VAR_environment: ${{ github.ref_name == 'main' && 'prod' || 'hml' }}
-          TF_VAR_database_url: ${{ secrets.DATABASE_URL }}
-          TF_VAR_jwt_secret: ${{ secrets.JWT_SECRET }}
         run: terraform apply -auto-approve -input=false
+
+      - name: Publish auth outputs
+        working-directory: terraform
+        run: |
+          echo "## Authentication" >> "$GITHUB_STEP_SUMMARY"
+          echo "AUTH_URL=$(terraform output -raw auth_url)" >> "$GITHUB_STEP_SUMMARY"
+          echo "API_GATEWAY_URL=$(terraform output -raw api_gateway_url)" >> "$GITHUB_STEP_SUMMARY"
+          echo "LAMBDA_NAME=$(terraform output -raw lambda_name)" >> "$GITHUB_STEP_SUMMARY"
