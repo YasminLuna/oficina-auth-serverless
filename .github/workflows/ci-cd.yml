@@ -99,12 +99,20 @@ jobs:
 
           SUBNET_IDS=$(aws ec2 describe-subnets \
             --filters "Name=vpc-id,Values=${VPC_ID}" "Name=tag:Name,Values=oficina-${ENV_NAME}-private-*" \
-            --query 'Subnets[].SubnetId' --output json)
+            --query 'Subnets[].SubnetId' --output json | jq -c '.')
+          if [ "$SUBNET_IDS" = "[]" ]; then
+            echo "Subnets privadas da Fase 3 para ${ENV_NAME} não encontradas" >&2
+            exit 1
+          fi
 
           DATABASE_SECRET=$(aws secretsmanager get-secret-value \
             --secret-id "oficina/${ENV_NAME}/database" \
             --query SecretString --output text)
           DATABASE_URL=$(echo "$DATABASE_SECRET" | jq -r '.url')
+          if [ -z "$DATABASE_URL" ] || [ "$DATABASE_URL" = "null" ]; then
+            echo "URL do banco não encontrada no secret oficina/${ENV_NAME}/database" >&2
+            exit 1
+          fi
 
           BACKEND_BASE_URL=""
           CLUSTER_NAME="oficina-${ENV_NAME}"
