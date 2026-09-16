@@ -1,0 +1,157 @@
+name: CI/CD - Auth Serverless
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, hml]
+  push:
+    branches: [hml, main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        env:
+          PYTHONPATH: .
+          JWT_SECRET: test-secret
+        run: pytest -q
+
+      - name: Build Lambda package
+        run: bash scripts/build_lambda.sh
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.8'
+
+      - name: Terraform format
+        working-directory: terraform
+        run: terraform fmt -recursive
+
+      - name: Terraform init
+        working-directory: terraform
+        run: terraform init -backend=false -input=false
+
+      - name: Terraform validate
+        working-directory: terraform
+        run: terraform validate -no-color
+
+  deploy:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && vars.ENABLE_DEPLOY == 'true' && vars.TF_STATE_READY == 'true' && vars.TF_STATE_BUCKET != ''
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'production' || 'homologation' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Build Lambda package
+        run: bash scripts/build_lambda.sh
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Discover infrastructure and database secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENV_NAME="${{ github.ref_name == 'main' && 'prod' || 'hml' }}"
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters \
+              "Name=tag:Project,Values=FIAP-Tech-Challenge-Fase3" \
+              "Name=tag:Environment,Values=${ENV_NAME}" \
+              "Name=tag:ManagedBy,Values=Terraform" \
+            --query 'Vpcs[0].VpcId' --output text)
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "VPC da Fase 3 para ${ENV_NAME} não encontrada" >&2
+            exit 1
+          fi
+
+          SUBNET_IDS=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=${VPC_ID}" "Name=tag:Name,Values=oficina-${ENV_NAME}-private-*" \
+            --query 'Subnets[].SubnetId' --output json)
+
+          DATABASE_SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id "oficina/${ENV_NAME}/database" \
+            --query SecretString --output text)
+          DATABASE_URL=$(echo "$DATABASE_SECRET" | jq -r '.url')
+
+          BACKEND_BASE_URL=""
+          CLUSTER_NAME="oficina-${ENV_NAME}"
+          if aws eks describe-cluster --name "$CLUSTER_NAME" >/dev/null 2>&1; then
+            aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "${{ vars.AWS_REGION || 'us-east-1' }}" >/dev/null
+            HOST=$(kubectl -n oficina get service oficina-api -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            if [ -z "$HOST" ]; then
+              HOST=$(kubectl -n oficina get service oficina-api -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            fi
+            if [ -n "$HOST" ]; then
+              BACKEND_BASE_URL="http://${HOST}"
+            fi
+          fi
+
+          echo "TF_VAR_vpc_id=$VPC_ID" >> "$GITHUB_ENV"
+          echo "TF_VAR_lambda_subnet_ids=$SUBNET_IDS" >> "$GITHUB_ENV"
+          echo "TF_VAR_database_url=$DATABASE_URL" >> "$GITHUB_ENV"
+          echo "TF_VAR_backend_base_url=$BACKEND_BASE_URL" >> "$GITHUB_ENV"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.8'
+
+      - name: Terraform init
+        working-directory: terraform
+        run: >-
+          terraform init -input=false
+          -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          -backend-config="key=oficina-auth-serverless/${{ github.ref_name }}/terraform.tfstate"
+          -backend-config="region=${{ vars.AWS_REGION || 'us-east-1' }}"
+          -backend-config="encrypt=true"
+
+      - name: Terraform apply
+        working-directory: terraform
+        env:
+          TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          TF_VAR_environment: ${{ github.ref_name == 'main' && 'prod' || 'hml' }}
+        run: terraform apply -auto-approve -input=false
+
+      - name: Publish auth outputs
+        working-directory: terraform
+        run: |
+          echo "## Authentication" >> "$GITHUB_STEP_SUMMARY"
+          echo "AUTH_URL=$(terraform output -raw auth_url)" >> "$GITHUB_STEP_SUMMARY"
+          echo "API_GATEWAY_URL=$(terraform output -raw api_gateway_url)" >> "$GITHUB_STEP_SUMMARY"
+          echo "LAMBDA_NAME=$(terraform output -raw lambda_name)" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${TF_VAR_backend_base_url:-}" ]; then
+            echo "BACKEND_PROXY=${TF_VAR_backend_base_url}" >> "$GITHUB_STEP_SUMMARY"
+          fi

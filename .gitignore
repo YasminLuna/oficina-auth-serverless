@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+build/
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/lambda.zip
+.env
+.DS_Store
